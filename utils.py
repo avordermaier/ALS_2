@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import os
 import matplotlib.colors as colors
 import torch
+from datetime import datetime
 
 
 def plot_results(train_metrics, test_metrics, window=100):
@@ -46,24 +47,57 @@ def plot_results(train_metrics, test_metrics, window=100):
     plt.show()
 
 
+def plot_epsilon(eps):
+    plt.title('Epsilon Decay')
+    plt.xlabel('Episode')
+    plt.ylabel('Epsilon')
+    plt.plot(eps)
+    x = [i for i in range(len(eps))]
+    amin = np.argmin(eps)
+    xlim, ylim = plt.xlim(), plt.ylim()
+    plt.plot([x[amin], x[amin], xlim[0]], [xlim[0], eps[amin], eps[amin]],
+             linestyle="--")
+    plt.xlim(xlim)
+    plt.ylim(ylim)
+    plt.show()
+
+
+
 def createDir(path):
     if os.path.exists(path) is False:
         os.makedirs(path, exist_ok=True)
 
 
-def save_rewards(path, rewards, speeds):
-    file_name = os.path.join(path, 'training_rewards.txt')
+def save_rewards(path, model, rewards):
+    time = datetime.now().strftime("%Y_%m_%d-%I_%M_%S_%p")
+    file_name = f'{model}_training_rewards_{time}.txt'
+    file_name = os.path.join(path, file_name)
     if os.path.exists(file_name):
         file = open(file_name, 'a')
     else:
         file = open(file_name, 'w')
-        file.write('reward,speed\n')
-    for x in zip(rewards, speeds):
-        file.write('{},{}\n'.format(x[0], x[1]))
+        file.write('reward\n')
+    for x in rewards:
+        file.write('{}\n'.format(x))
+    file.close()
+
+def save_loss(path, model, loss):
+    time = datetime.now().strftime("%Y_%m_%d-%I_%M_%S_%p")
+    file_name = f'{model}_training_loss_{time}.txt'
+    file_name = os.path.join(path, file_name)
+    if os.path.exists(file_name):
+        file = open(file_name, 'a')
+    else:
+        file = open(file_name, 'w')
+        file.write('loss\n')
+    for x in loss:
+        file.write('{}\n'.format(x))
     file.close()
 
 
 def save_weights(path, online_dqn, file_name=None):
+    time = datetime.now().strftime("%Y_%m_%d-%I_%M_%S_%p")
+    file_name = f'{file_name}_{time}.pt'
     if file_name is None:
         file_name = 'dqn_weights.pt'
     weights_path = os.path.join(path, file_name)

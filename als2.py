@@ -8,10 +8,10 @@ import torchvision
 import copy
 from gym.wrappers import FrameStack
 from gym.spaces import Box
-from collections import deque, namedtuple
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-from utils import plot_results, createDir
+from utils import plot_results, createDir, save_weights, save_loss, save_rewards, plot_epsilon
+from ExperienceReplay import ExperienceReplayMemory, PrioritizedReplayMemory
 
 
 class SkipFrame(gym.Wrapper):
@@ -57,35 +57,10 @@ class ResizeObservation(gym.ObservationWrapper):
         return transforms(observation).squeeze(0)
 
 
-class ExperienceReplayMemory(object):
-    def __init__(self, capacity):
-        self.memory = deque([], maxlen=capacity)
-        self.n_step = 1
-        self.experience = namedtuple("Experience", field_names=["state", "next_state", "action", "reward", "done"])
-
-    def __len__(self):
-        return len(self.memory)
-
-    def store(self, state, next_state, action, reward, done):
-        state = state.__array__()
-        next_state = next_state.__array__()
-        self.memory.append(self.experience(state, next_state, action, reward, done))
-
-    def sample(self, batch_size):
-        # TODO: uniformly sample batches of Tensors for: state, next_state, action, reward, done
-        # ...
-        transitions = random.sample(self.memory, batch_size)
-        state = [t.state for t in transitions]
-        next_state = [t.next_state for t in transitions]
-        action = np.asarray([t.action for t in transitions])
-        reward = np.asarray([t.reward for t in transitions])
-        done = np.asarray([t.done for t in transitions])
-        return np.array(state), np.array(next_state), np.array(action), np.array(reward), np.array(done).astype(np.uint8)
-
-
-run_as_ddqn = True
+run_as_ddqn = False
 device = None
 path = os.path.join(os.getcwd(), 'Breakoutv4')
+loss_function = 'huber'# 'mse'
 
 env = gym.make("BreakoutNoFrameskip-v4")
 env = SkipFrame(env, skip=4)
@@ -107,20 +82,33 @@ if torch.backends.cudnn.enabled:
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+# Evaluating
+epsilons = []
+mean_training_rewards = []
+mean_reward = 0
+reward_threshold = 20
+best_ep_avg = 0
+
+
 # Parameters
 batch_size = 32
 alpha = 0.00025
 gamma = 0.99
 eps, eps_decay = 1.0, 0.999
-max_train_episodes = 1000
+max_train_episodes = 100
 max_test_episodes = 100
 max_train_frames = 1000
 burn_in_phase = 200
 sync_target = 100
 curr_step = 0
 n_step = 1
-buffer = ExperienceReplayMemory(500)
-
+with_prio_replay = False
+buffer_size = 500
+# Replay memory
+if with_prio_replay:
+    buffer = PrioritizedReplayMemory(buffer_size, gamma=gamma, n_step=n_step)
+else:
+    buffer = ExperienceReplayMemory(buffer_size, gamma, n_step)
 
 
 def convert(x):
@@ -189,9 +177,8 @@ def policy(state, is_training):
     if np.random.random() < eps:
         action = np.random.choice(action_list)
     else:
-        with torch.no_grad():
-            qvals = online_dqn(state)
-            action = torch.max(qvals, dim=-1)[1].item()
+        qvals = online_dqn(state)
+        action = torch.max(qvals, dim=-1)[1].item()
 
     return action
 
@@ -214,13 +201,54 @@ def compute_loss(state, action, reward, next_state, done):
         q_targets_next = q_targets_next.unsqueeze(1)
 
     # Compute Q targets for current states
+    # note n_step for multistep learning
     q_targets = reward + (gamma ** n_step * q_targets_next * (1 - done))
     # Get expected Q values from local model
 
     q_expected = online_dqn(state).gather(1, action.type(torch.int64))
     # action_q_values = torch.gather(online_dqn(state), dim=1, index=action)
 
-    loss = criterion(q_expected, q_targets)
+    if loss_function == 'mse':
+        loss = criterion(q_expected, q_targets)
+    elif loss_function == 'huber':
+        loss = huber_loss(q_expected, q_targets)
+    else: raise Exception(loss_function)
+
+    # TODO: Return the loss computed using the criterion.
+    return loss
+
+
+def compute_loss_prio(state, action, reward, next_state, done, indices, weights):
+    state = convert(state).type(torch.float32).to(device)
+    next_state = convert(next_state).type(torch.float32).to(device)
+    action = torch.tensor(action, dtype=torch.int64).to(device).unsqueeze(-1)
+    reward = torch.tensor(reward, dtype=torch.float32).to(device).unsqueeze(-1)
+    done = torch.tensor(done, dtype=torch.float32).to(device).unsqueeze(-1)
+    indices = torch.tensor(indices, dtype=torch.float32).to(device).unsqueeze(-1)
+    weights = torch.tensor(weights, dtype=torch.float32).to(device).unsqueeze(-1)
+
+    # Get max predicted Q values (for next states) from target model
+    q_targets_next = target_dqn(next_state).detach()
+    if run_as_ddqn:
+        best_action = torch.argmax(online_dqn(next_state), dim=-1)
+        q_targets_next = q_targets_next.gather(1, torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
+
+    else:
+        q_targets_next = q_targets_next.max(1)[0]
+        q_targets_next = q_targets_next.unsqueeze(1)
+
+    # Compute Q targets for current states
+    # note n_step for multistep learning
+    q_targets = reward + (gamma ** n_step * q_targets_next * (1 - done))
+    # Get expected Q values from local model
+
+    q_expected = online_dqn(state).gather(1, action.type(torch.int64))
+    # action_q_values = torch.gather(online_dqn(state), dim=1, index=action)
+
+    td_error = q_targets - q_expected
+    #mse
+    loss = (td_error.pow(2) * weights).mean().to(device)
+    buffer.update_priorities(indices, abs(td_error.detach().numpy()))
 
     # TODO: Return the loss computed using the criterion.
     return loss
@@ -247,20 +275,28 @@ def run_episode(curr_step, buffer, is_training, is_rendering=False):
             buffer.store(state, next_state, action, reward, done)
 
             if curr_step > burn_in_phase:
-                state_batch, next_state_batch, action_batch, reward_batch, done_batch = buffer.sample(batch_size)
+                if with_prio_replay:
+                    state_batch, next_state_batch, action_batch, reward_batch, done_batch, indices, weights = buffer.sample(batch_size)
+                else:
+                    state_batch, next_state_batch, action_batch, reward_batch, done_batch = buffer.sample(batch_size)
 
                 if curr_step % sync_target == 0:
                     # TODO: Periodically update your target_dqn at each sync_target frames
                     target_dqn.load_state_dict(online_dqn.state_dict())
 
-                loss = compute_loss(state_batch, action_batch, reward_batch, next_state_batch, done_batch)
+                if with_prio_replay:
+                    loss = compute_loss_prio(state_batch, action_batch, reward_batch, next_state_batch, done_batch,
+                                             indices, weights)
+                else:
+                    loss = compute_loss(state_batch, action_batch, reward_batch, next_state_batch, done_batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 episode_loss += loss.item()
         else:
             with torch.no_grad():
-                episode_loss += compute_loss(np.array([state]), np.array([action]), reward, np.array([next_state]), done).item()
+                episode_loss += compute_loss(np.array([state]), np.array([action]), reward, np.array([next_state]),
+                                             done).item()
 
         state = next_state
 
@@ -276,31 +312,56 @@ def update_metrics(metrics, episode):
 
 
 def print_metrics(it, metrics, is_training, window=100):
+    global best_ep_avg
     reward_mean = np.mean(metrics['reward'][-window:])
     loss_mean = np.mean(metrics['loss'][-window:])
     mode = "train" if is_training else "test"
     print(f"Episode {it:4d} | {mode:5s} | reward {reward_mean:5.5f} | loss {loss_mean:5.5f}")
 
+    mean_training_rewards.append(reward_mean)
+    if is_training and max(mean_training_rewards) > best_ep_avg:
+        best_ep_avg = max(mean_training_rewards)
+        print("\nNew best {} episode average: {:.2f}".format(window, best_ep_avg))
+        save_weights(path, online_dqn, file_name="ep_{}_dqn_weights".format(it))
+
+    return reward_mean
+
 
 createDir(path)
-
 train_metrics = dict(reward=[], loss=[])
 for it in range(max_train_episodes):
     episode_metrics = run_episode(curr_step, buffer, is_training=True)
     update_metrics(train_metrics, episode_metrics)
     if it % 10 == 0:
-        print_metrics(it, train_metrics, is_training=True)
+        mean_reward = print_metrics(it, train_metrics, is_training=True)
     eps *= eps_decay
+    epsilons.append(eps)
+    if mean_reward >= reward_threshold:
+        print('\nEnvironment solved in {} steps!'.format(it))
+        break
+
+save_loss(path, 'ddqn' if run_as_ddqn else 'dqn', train_metrics['loss'])
+save_rewards(path, 'ddqn' if run_as_ddqn else 'dqn', train_metrics['reward'])
+
 
 plt.plot(train_metrics['reward'])
+x = [i for i in range(len(train_metrics['reward']))]
 plt.ylabel('Training Reward')
 plt.xlabel('Number of Episodes')
+amax = np.argmax(train_metrics['reward'])
+xlim, ylim = plt.xlim(), plt.ylim()
+plt.plot([x[amax], x[amax], xlim[0]], [xlim[0], train_metrics['reward'][amax], train_metrics['reward'][amax]],
+          linestyle="--")
+plt.xlim(xlim)
+plt.ylim(ylim)
 plt.show()
 
 plt.plot(train_metrics['loss'])
 plt.ylabel('Training Loss')
 plt.xlabel('Number of Episodes')
 plt.show()
+
+plot_epsilon(epsilons)
 
 test_metrics = dict(reward=[], loss=[])
 curr_step = 0
