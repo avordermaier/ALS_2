@@ -60,7 +60,7 @@ class ResizeObservation(gym.ObservationWrapper):
 run_as_ddqn = False
 device = None
 path = os.path.join(os.getcwd(), 'Breakoutv4')
-loss_function = 'huber'# 'mse'
+loss_function = 'huber'  # 'mse'
 
 env = gym.make("BreakoutNoFrameskip-v4")
 env = SkipFrame(env, skip=4)
@@ -89,7 +89,6 @@ mean_reward = 0
 reward_threshold = 20
 best_ep_avg = 0
 
-
 # Parameters
 batch_size = 32
 alpha = 0.00025
@@ -101,7 +100,7 @@ max_train_frames = 1000
 burn_in_phase = 200
 sync_target = 100
 curr_step = 0
-n_step = 1
+n_step = 3
 with_prio_replay = False
 buffer_size = 500
 # Replay memory
@@ -177,8 +176,13 @@ def policy(state, is_training):
     if np.random.random() < eps:
         action = np.random.choice(action_list)
     else:
-        qvals = online_dqn(state)
-        action = torch.max(qvals, dim=-1)[1].item()
+        if is_training:
+            qvals = online_dqn(state)
+            action = torch.max(qvals, dim=-1)[1].item()
+        else:
+            with torch.no_grad():
+                qvals = online_dqn(state)
+                action = torch.max(qvals, dim=-1)[1].item()
 
     return action
 
@@ -194,7 +198,8 @@ def compute_loss(state, action, reward, next_state, done):
     q_targets_next = target_dqn(next_state).detach()
     if run_as_ddqn:
         best_action = torch.argmax(online_dqn(next_state), dim=-1)
-        q_targets_next = q_targets_next.gather(1, torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
+        q_targets_next = q_targets_next.gather(1,
+                                               torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
 
     else:
         q_targets_next = q_targets_next.max(1)[0]
@@ -212,7 +217,8 @@ def compute_loss(state, action, reward, next_state, done):
         loss = criterion(q_expected, q_targets)
     elif loss_function == 'huber':
         loss = huber_loss(q_expected, q_targets)
-    else: raise Exception(loss_function)
+    else:
+        raise Exception(loss_function)
 
     # TODO: Return the loss computed using the criterion.
     return loss
@@ -231,7 +237,8 @@ def compute_loss_prio(state, action, reward, next_state, done, indices, weights)
     q_targets_next = target_dqn(next_state).detach()
     if run_as_ddqn:
         best_action = torch.argmax(online_dqn(next_state), dim=-1)
-        q_targets_next = q_targets_next.gather(1, torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
+        q_targets_next = q_targets_next.gather(1,
+                                               torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
 
     else:
         q_targets_next = q_targets_next.max(1)[0]
@@ -246,7 +253,7 @@ def compute_loss_prio(state, action, reward, next_state, done, indices, weights)
     # action_q_values = torch.gather(online_dqn(state), dim=1, index=action)
 
     td_error = q_targets - q_expected
-    #mse
+    # mse
     loss = (td_error.pow(2) * weights).mean().to(device)
     buffer.update_priorities(indices, abs(td_error.detach().numpy()))
 
@@ -276,7 +283,8 @@ def run_episode(curr_step, buffer, is_training, is_rendering=False):
 
             if curr_step > burn_in_phase:
                 if with_prio_replay:
-                    state_batch, next_state_batch, action_batch, reward_batch, done_batch, indices, weights = buffer.sample(batch_size)
+                    state_batch, next_state_batch, action_batch, reward_batch, done_batch, indices, weights = buffer.sample(
+                        batch_size)
                 else:
                     state_batch, next_state_batch, action_batch, reward_batch, done_batch = buffer.sample(batch_size)
 
@@ -343,7 +351,6 @@ for it in range(max_train_episodes):
 save_loss(path, 'ddqn' if run_as_ddqn else 'dqn', train_metrics['loss'])
 save_rewards(path, 'ddqn' if run_as_ddqn else 'dqn', train_metrics['reward'])
 
-
 plt.plot(train_metrics['reward'])
 x = [i for i in range(len(train_metrics['reward']))]
 plt.ylabel('Training Reward')
@@ -351,7 +358,7 @@ plt.xlabel('Number of Episodes')
 amax = np.argmax(train_metrics['reward'])
 xlim, ylim = plt.xlim(), plt.ylim()
 plt.plot([x[amax], x[amax], xlim[0]], [xlim[0], train_metrics['reward'][amax], train_metrics['reward'][amax]],
-          linestyle="--")
+         linestyle="--")
 plt.xlim(xlim)
 plt.ylim(ylim)
 plt.show()
