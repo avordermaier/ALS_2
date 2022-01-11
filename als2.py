@@ -11,7 +11,7 @@ from gym.spaces import Box
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from utils import plot_results, createDir, save_weights, save_loss, save_rewards, plot_epsilon
-from ExperienceReplay import ExperienceReplayMemory, PrioritizedReplayMemory
+from ExperienceReplay import ExperienceReplayMemory, PrioritizedReplayMemory, ReplayBuffer
 
 
 class SkipFrame(gym.Wrapper):
@@ -89,6 +89,22 @@ mean_reward = 0
 reward_threshold = 20
 best_ep_avg = 0
 
+
+#  'eps_start': 1,
+#     'eps_end': 0.02,
+#     'eps_decay': 10 ** 5,
+#     'buffer_size': 15000,
+#     'buffer_minimum': 10001,
+#     'learning_rate': 5e-5,
+#     'gamma': 0.99,
+#     'n_iter_update_nn': 1000,
+#     'multi_step': 2,
+#     'double_dqn': True,
+#     'dueling': False
+# }
+
+
+
 # Parameters
 batch_size = 32
 alpha = 0.00025
@@ -107,7 +123,8 @@ buffer_size = 500
 if with_prio_replay:
     buffer = PrioritizedReplayMemory(buffer_size, gamma=gamma, n_step=n_step)
 else:
-    buffer = ExperienceReplayMemory(buffer_size, gamma, n_step)
+    #buffer = ExperienceReplayMemory(buffer_size, gamma, n_step)
+    buffer = ReplayBuffer(buffer_size, 32, n_step, gamma)
 
 
 def convert(x):
@@ -120,10 +137,13 @@ class DQN(nn.Module):
 
         self.conv = nn.Sequential(
             nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4),
+            #nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            #nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            #nn.BatchNorm2d(64),
             nn.ReLU()
         )
 
@@ -152,6 +172,10 @@ class DQN(nn.Module):
 
 online_dqn = DQN(env.observation_space.shape, num_actions)
 target_dqn = copy.deepcopy(online_dqn)
+# or:
+# online_dqn = DQN(env.observation_space.shape, num_actions)
+# target_dqn = DQN(env.observation_space.shape, num_actions)
+# self.target_nn.load_state_dict(self.moving_nn.state_dict())
 online_dqn = online_dqn.to(device)
 target_dqn = target_dqn.to(device)
 
@@ -161,8 +185,7 @@ print(online_dqn)
 # TODO: create the appropriate MSE criterion and Adam optimizer
 # ...
 optimizer = torch.optim.Adam(online_dqn.parameters(), lr=alpha)
-criterion = F.mse_loss
-huber_loss = torch.nn.SmoothL1Loss()
+criterion = F.mse_loss if loss_function == 'mse' else torch.nn.SmoothL1Loss()
 
 
 def policy(state, is_training):
@@ -186,6 +209,43 @@ def policy(state, is_training):
 
     return action
 
+#TODO: Test this function instead of compute_loss
+def calc_loss(state, action, reward, next_state, done):
+    # Transform numpy array to Tensor and send it to GPU
+    states_tensor = torch.as_tensor(state).to(device)
+    next_states_tensor = torch.as_tensor(next_state).to(device)
+    actions_tensor = torch.as_tensor(action,  dtype=torch.int64).to(device)
+    rewards_tensor = torch.as_tensor(reward, dtype=torch.float32).to(device)
+    done_tensor = torch.as_tensor(done, dtype=torch.uint8).to(device)
+
+    # First we need to find value of action we decided to do
+    # From inputing states into NN, we will get output matrix BATCH_SIZEx6
+    # Then with tensor.gather(dimension, index) we find that value with index from actions
+    # Finally we use squeeze(-1) to reduce dimensions from 2 to 1
+    curr_state_action_value = online_dqn(states_tensor).gather(1, actions_tensor[:, None]).squeeze(-1)
+
+    if run_as_ddqn:
+        # Double Q Learning will be implemented with getting max action (serial number) from first NN for each of 32 states,
+        # then we get 32x6 output of second NN and we take value from 32x6 matrix that is on place of serial number from first
+        # Take best action's serial number from first NN
+        double_dqn_max_action = online_dqn(next_states_tensor).max(1)[1]
+        double_dqn_max_action.detach()
+        # Get 1x6 with action values from second NN
+        second_nn_actions = target_dqn(next_states_tensor)
+        next_state_action_value = second_nn_actions.gather(1, double_dqn_max_action[:,None]).squeeze(-1)
+    else:
+        # We need to find best next action and we will get that by appling NN with older params (target_NN)
+        # which we will update to new after X iteration. Using old params we avoid Q Learning problem with not
+        # converging since if we use only one NN its not gradient descent.
+        next_state_action_value = target_dqn(next_states_tensor).max(1)[0]
+    # We do differentiation for moving_nn (w or curr_state_action_value) and we dont do it for target_nn (w'),
+    # so we dont have to remember operations for backprop. Good for huge amount of operations
+    next_state_action_value = next_state_action_value.detach()
+    # Calculate Q-target
+    q_target = rewards_tensor + (gamma ** n_step) * next_state_action_value
+    # Apply MSE Loss or huber loss which will be applied to all BATCH_SIZEx1 rows and output will be 1x1
+    return criterion(curr_state_action_value, q_target)
+
 
 def compute_loss(state, action, reward, next_state, done):
     state = convert(state).type(torch.float32).to(device)
@@ -198,8 +258,7 @@ def compute_loss(state, action, reward, next_state, done):
     q_targets_next = target_dqn(next_state).detach()
     if run_as_ddqn:
         best_action = torch.argmax(online_dqn(next_state), dim=-1)
-        q_targets_next = q_targets_next.gather(1,
-                                               torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
+        q_targets_next = q_targets_next.gather(1, torch.tensor(best_action, dtype=torch.int64, device=device).unsqueeze(1))
 
     else:
         q_targets_next = q_targets_next.max(1)[0]
@@ -213,12 +272,7 @@ def compute_loss(state, action, reward, next_state, done):
     q_expected = online_dqn(state).gather(1, action.type(torch.int64))
     # action_q_values = torch.gather(online_dqn(state), dim=1, index=action)
 
-    if loss_function == 'mse':
-        loss = criterion(q_expected, q_targets)
-    elif loss_function == 'huber':
-        loss = huber_loss(q_expected, q_targets)
-    else:
-        raise Exception(loss_function)
+    loss = criterion(q_expected, q_targets)
 
     # TODO: Return the loss computed using the criterion.
     return loss
@@ -296,14 +350,17 @@ def run_episode(curr_step, buffer, is_training, is_rendering=False):
                     loss = compute_loss_prio(state_batch, action_batch, reward_batch, next_state_batch, done_batch,
                                              indices, weights)
                 else:
-                    loss = compute_loss(state_batch, action_batch, reward_batch, next_state_batch, done_batch)
+                    #loss = compute_loss(state_batch, action_batch, reward_batch, next_state_batch, done_batch)
+                    loss = calc_loss(state_batch, action_batch, reward_batch, next_state_batch, done_batch)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 episode_loss += loss.item()
         else:
             with torch.no_grad():
-                episode_loss += compute_loss(np.array([state]), np.array([action]), reward, np.array([next_state]),
+                #episode_loss += compute_loss(np.array([state]), np.array([action]), reward, np.array([next_state]),
+                #                             done).item()
+                episode_loss += calc_loss(np.array([state]), np.array([action]), reward, np.array([next_state]),
                                              done).item()
 
         state = next_state
